@@ -544,7 +544,7 @@ std::pair<void *, void *> CreateDualMapping(int fd) {
     auto *writable_memory = mmap(reserved + kPageSize, kPageSize, PROT_READ | PROT_WRITE,
                                  MAP_SHARED | MAP_FIXED, fd, 0);
     if (executable_memory == MAP_FAILED || writable_memory == MAP_FAILED) [[unlikely]] {
-        PLOGE("mmap ashmem");
+        PLOGE("mmap dual mapping");
         munmap(reserved, reserved_size);
         close(fd);
         return {};
