@@ -859,8 +859,8 @@ using ::lsplant::IsHooked;
         }
     }
 
-    auto reflected_hook = JNI_ToReflectedMethod(env, built_class, hook_method, is_static);
-    auto reflected_backup = JNI_ToReflectedMethod(env, built_class, backup_method, is_static);
+    auto reflected_hook = JNI_ToReflectedMethod(env, built_class, hook_method, JNI_TRUE);
+    auto reflected_backup = JNI_ToReflectedMethod(env, built_class, backup_method, JNI_TRUE);
 
     JNI_CallVoidMethod(env, reflected_backup, set_accessible, JNI_TRUE);
 
