@@ -7,14 +7,18 @@ module;
 #include <jni.h>
 #include <linux/ashmem.h>
 #include <sys/mman.h>
+#include <sys/utsname.h>
+#include <syscall.h>
 #include <unistd.h>
 
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 
 #include "logging.hpp"
 
@@ -494,9 +498,22 @@ const auto kPageSize = static_cast<size_t>(getpagesize());  // assume
 const auto kPageMask = static_cast<uintptr_t>(kPageSize - 1);
 
 SharedHashSet<void *> mmap_regions;
-SharedHashSet<void *> ashmem_regions;
+SharedHashSet<void *> dual_regions;
 
-auto ashmem_device_path = [] {
+auto [ashmem_device_path, use_memfd] = [] {
+    if (utsname un{}; GetAndroidApiLevel() >= kSdkQ && uname(&un) == 0) [[likely]] {
+        static constexpr uintptr_t kRequiredMajor = 3;
+        static constexpr uintptr_t kRequiredMinor = 17;
+
+        char *minor_str = nullptr;
+        auto major = strtoul(un.release, &minor_str, 10);
+        auto minor = minor_str ? strtoul(minor_str + 1, nullptr, 10) : 0UL;
+
+        if (major > kRequiredMajor || (major == kRequiredMajor && minor > kRequiredMinor))
+            [[likely]] {
+            return std::pair{std::string{}, true};
+        }
+    }
     if (auto fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC, 0); fd >= 0)
         [[likely]] {
         std::array<char, 36> boot_id;
@@ -505,12 +522,56 @@ auto ashmem_device_path = [] {
         if (size == boot_id.size()) {
             auto path = "/dev/ashmem"s + std::string{boot_id.data(), boot_id.size()};
             if (access(path.c_str(), F_OK) == 0) [[likely]] {
-                return path;
+                return std::pair{path, false};
             }
         }
     }
-    return "/dev/ashmem"s;
+    return std::pair{"/dev/ashmem"s, false};
 }();
+
+std::pair<void *, void *> CreateDualMapping(int fd) {
+    auto reserved_size = kPageSize * 2;
+    auto *reserved = static_cast<uint8_t *>(
+        mmap(nullptr, reserved_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (reserved == MAP_FAILED) [[unlikely]] {
+        PLOGE("mmap reserved memory");
+        close(fd);
+        return {};
+    }
+
+    auto *executable_memory =
+        mmap(reserved, kPageSize, PROT_READ | PROT_EXEC, MAP_SHARED | MAP_FIXED, fd, 0);
+    auto *writable_memory = mmap(reserved + kPageSize, kPageSize, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED | MAP_FIXED, fd, 0);
+    if (executable_memory == MAP_FAILED || writable_memory == MAP_FAILED) [[unlikely]] {
+        PLOGE("mmap ashmem");
+        munmap(reserved, reserved_size);
+        close(fd);
+        return {};
+    }
+
+    close(fd);
+
+    dual_regions.emplace(reserved);
+    return {executable_memory, writable_memory};
+}
+
+void *AllocateMemoryFromMemfd() {
+    auto memfd = static_cast<int>(syscall(__NR_memfd_create, "", 0));
+    if (memfd < 0) [[unlikely]] {
+        PLOGE("create memfd");
+        return nullptr;
+    }
+    if (ftruncate(memfd, kPageSize) < 0) [[unlikely]] {
+        PLOGE("truncate memfd");
+        close(memfd);
+        return nullptr;
+    }
+
+    auto [executable_memory, writable_memory] = CreateDualMapping(memfd);
+    LOGV("memfd regions: r-xs = %p, rw-s = %p", executable_memory, writable_memory);
+    return executable_memory;
+}
 
 void *AllocateMemoryFromAshmem() {
     auto ashmem = open(ashmem_device_path.c_str(), O_RDWR | O_CLOEXEC, 0);
@@ -524,35 +585,21 @@ void *AllocateMemoryFromAshmem() {
         return nullptr;
     }
 
-    auto reserved_size = kPageSize * 2;
-    auto *reserved = static_cast<uint8_t *>(
-        mmap(nullptr, reserved_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (reserved == MAP_FAILED) [[unlikely]] {
-        PLOGE("mmap reserved memory");
-        close(ashmem);
-        return nullptr;
-    }
-
-    auto *executable_memory =
-        mmap(reserved, kPageSize, PROT_READ | PROT_EXEC, MAP_SHARED | MAP_FIXED, ashmem, 0);
-    auto *writable_memory = mmap(reserved + kPageSize, kPageSize, PROT_READ | PROT_WRITE,
-                                 MAP_SHARED | MAP_FIXED, ashmem, 0);
-    if (executable_memory == MAP_FAILED || writable_memory == MAP_FAILED) [[unlikely]] {
-        PLOGE("mmap ashmem");
-        munmap(reserved, reserved_size);
-        close(ashmem);
-        return nullptr;
-    }
-
-    close(ashmem);
-
-    ashmem_regions.emplace(reserved);
+    auto [executable_memory, writable_memory] = CreateDualMapping(ashmem);
     LOGV("ashmem regions: r-xs = %p, rw-s = %p, source = %s", executable_memory, writable_memory,
          ashmem_device_path.c_str());
-    return reserved;
+    return executable_memory;
 }
 
 void *AllocateMemory() {
+    if (use_memfd) [[likely]] {
+        if (auto *memory = AllocateMemoryFromMemfd()) [[likely]] {
+            LOGV("memory allocated from memfd: %p", memory);
+            return memory;
+        }
+        use_memfd = false;
+    }
+
     if (!ashmem_device_path.empty()) [[likely]] {
         if (auto *memory = AllocateMemoryFromAshmem()) [[likely]] {
             LOGV("memory allocated from ashmem: %p", memory);
@@ -560,6 +607,7 @@ void *AllocateMemory() {
         }
         ashmem_device_path = {};
     }
+
     auto *memory = mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (memory == MAP_FAILED) [[unlikely]] {
@@ -578,7 +626,7 @@ void *GenerateTrampolineFor(art::ArtMethod *hook) {
     if (executable_memory_allocator) {
         if (auto *memory = static_cast<char *>(executable_memory_allocator(data))) [[likely]] {
             __builtin___clear_cache(memory, memory + data.size());
-            LOGV("allocate memory from user: %p", memory);
+            LOGV("memory allocated from user: %p", memory);
             return memory;
         }
     }
@@ -614,7 +662,7 @@ void *GenerateTrampolineFor(art::ArtMethod *hook) {
         break;
     }
     auto *address_ptr = reinterpret_cast<char *>(address);
-    if (ashmem_regions.contains(__builtin_align_down(address_ptr, kPageSize))) [[likely]] {
+    if (dual_regions.contains(__builtin_align_down(address_ptr, kPageSize))) [[likely]] {
         std::memcpy(address_ptr + kPageSize, data.data(), data.size());
     } else {
         std::memcpy(address_ptr, data.data(), data.size());
@@ -664,9 +712,9 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
     auto *entry_point = target->GetEntryPoint();
     target->CopyFrom(backup);
     target->SetAccessFlags(access_flags);
-    if (auto *start = __builtin_align_down(entry_point, kPageSize);
-        executable_memory_recycler && !mmap_regions.contains(start) &&
-        !ashmem_regions.contains(start)) {
+    if (auto *start = __builtin_align_down(entry_point, kPageSize); executable_memory_recycler &&
+                                                                    !mmap_regions.contains(start) &&
+                                                                    !dual_regions.contains(start)) {
         executable_memory_recycler(entry_point);
     }
     LOGV("Done unhook: target(%p:0x%x) -> %p; backup(%p:0x%x) -> %p;", target,
