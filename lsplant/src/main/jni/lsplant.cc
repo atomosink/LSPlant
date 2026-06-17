@@ -569,6 +569,10 @@ void *AllocateMemoryFromMemfd() {
     }
 
     auto [executable_memory, writable_memory] = CreateDualMapping(memfd);
+    if (!executable_memory || !writable_memory) [[unlikely]] {
+        return nullptr;
+    }
+
     LOGV("memfd regions: r-xs = %p, rw-s = %p", executable_memory, writable_memory);
     return executable_memory;
 }
@@ -586,6 +590,10 @@ void *AllocateMemoryFromAshmem() {
     }
 
     auto [executable_memory, writable_memory] = CreateDualMapping(ashmem);
+    if (!executable_memory || !writable_memory) [[unlikely]] {
+        return nullptr;
+    }
+
     LOGV("ashmem regions: r-xs = %p, rw-s = %p, source = %s", executable_memory, writable_memory,
          ashmem_device_path.c_str());
     return executable_memory;
