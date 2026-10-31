@@ -43,6 +43,18 @@ struct InitInfo {
     /// \note It should be able to resolve symbols from both .dynsym and .symtab.
     using ArtSymbolPrefixResolver = std::function<void *(std::string_view symbol_prefix)>;
 
+    /// \brief Type of custom mmap function for internal memory allocations.
+    /// When set, LSPlant routes all its internal anonymous mappings (trampoline pages,
+    /// dual-mapping reservations, in-memory dex images) through it instead of the raw
+    /// mmap() syscall, allowing the host to relocate or disguise these mappings.
+    /// Return MAP_FAILED on failure. May be null (raw mmap is used).
+    using MemMapFunc = std::function<void *(void *addr, size_t length, int prot, int flags,
+                                            int fd, off_t offset)>;
+    /// \brief Type of custom munmap function. Must be set when \ref mem_map is set and
+    /// the host relocated mappings, so LSPlant can release memory through the host.
+    /// Return 0 on success. May be null (raw munmap is used).
+    using MemUnmapFunc = std::function<int(void *addr, size_t length)>;
+
     /// \brief Type of memory allocator for executable code.
     /// In \ref std::function form, but it MUST NOT have a capture list.<br>
     /// \p data is the executable code data to be allocated and copied.<br>
@@ -80,6 +92,10 @@ struct InitInfo {
     /// \brief The memory recycler for executable code. May be null.
     /// It must be non-null if \p executable_memory_allocator is provided.
     MemoryRecycler executable_memory_recycler;
+    /// \brief The custom mmap for internal anonymous mappings. May be null.
+    MemMapFunc mem_map;
+    /// \brief The custom munmap matching \ref mem_map. May be null.
+    MemUnmapFunc mem_unmap;
 };
 
 /// \brief Initialize LSPlant for the proceeding hook.

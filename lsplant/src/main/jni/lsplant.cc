@@ -123,6 +123,23 @@ std::string generated_method_name;
 InitInfo::MemoryAllocator executable_memory_allocator;
 InitInfo::MemoryRecycler executable_memory_recycler;
 
+InitInfo::MemMapFunc mem_map_hook;
+InitInfo::MemUnmapFunc mem_unmap_hook;
+
+void *MyMmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    if (mem_map_hook) [[unlikely]] {
+        return mem_map_hook(addr, length, prot, flags, fd, offset);
+    }
+    return mmap(addr, length, prot, flags, fd, offset);
+}
+
+int MyMunmap(void *addr, size_t length) {
+    if (mem_unmap_hook) [[unlikely]] {
+        return mem_unmap_hook(addr, length);
+    }
+    return munmap(addr, length);
+}
+
 bool InitConfig(const InitInfo &info) {
     if (info.generated_class_name.empty()) {
         LOGE("generated class name cannot be empty");
@@ -146,6 +163,8 @@ bool InitConfig(const InitInfo &info) {
     generated_source_name = info.generated_source_name;
     executable_memory_allocator = info.executable_memory_allocator;
     executable_memory_recycler = info.executable_memory_recycler;
+    mem_map_hook = info.mem_map;
+    mem_unmap_hook = info.mem_unmap;
     return true;
 }
 
@@ -449,8 +468,12 @@ std::tuple<jclass, jfieldID, jmethodID, jmethodID> BuildDex(JNIEnv *env, jobject
             env, dex_file_class, dex_file_init,
             JNI_NewDirectByteBuffer(env, const_cast<void *>(image.ptr()), image.size()));
     } else {
-        void *target =
-            mmap(nullptr, image.size(), PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        void *target = MyMmap(nullptr, image.size(), PROT_WRITE | PROT_READ,
+                              MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        if (target == MAP_FAILED) [[unlikely]] {
+            LOGE("Failed to mmap for dex image");
+            return {nullptr, nullptr, nullptr, nullptr};
+        }
         ::memcpy(target, image.ptr(), image.size());
         mprotect(target, image.size(), PROT_READ);
         std::string err_msg;
@@ -546,19 +569,19 @@ auto [ashmem_device_path, use_memfd] = [] -> std::pair<std::string, bool> {
 std::pair<void *, void *> CreateDualMapping(int fd) {
     auto reserved_size = kPageSize * 2;
     auto *reserved = static_cast<uint8_t *>(
-        mmap(nullptr, reserved_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        MyMmap(nullptr, reserved_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     if (reserved == MAP_FAILED) [[unlikely]] {
         PLOGE("mmap reserved memory");
         return {};
     }
 
     auto *executable_memory =
-        mmap(reserved, kPageSize, PROT_READ | PROT_EXEC, MAP_SHARED | MAP_FIXED, fd, 0);
-    auto *writable_memory = mmap(reserved + kPageSize, kPageSize, PROT_READ | PROT_WRITE,
-                                 MAP_SHARED | MAP_FIXED, fd, 0);
+        MyMmap(reserved, kPageSize, PROT_READ | PROT_EXEC, MAP_SHARED | MAP_FIXED, fd, 0);
+    auto *writable_memory = MyMmap(reserved + kPageSize, kPageSize, PROT_READ | PROT_WRITE,
+                                   MAP_SHARED | MAP_FIXED, fd, 0);
     if (executable_memory == MAP_FAILED || writable_memory == MAP_FAILED) [[unlikely]] {
         PLOGE("mmap dual mapping");
-        munmap(reserved, reserved_size);
+        MyMunmap(reserved, reserved_size);
         return {};
     }
 
@@ -628,8 +651,8 @@ void *AllocateMemory() {
         ashmem_device_path = {};
     }
 
-    auto *memory = mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    auto *memory = MyMmap(nullptr, kPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (memory == MAP_FAILED) [[unlikely]] {
         PLOGE("mmap trampoline");
         return nullptr;
