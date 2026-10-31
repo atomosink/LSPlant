@@ -146,8 +146,12 @@ inline void RecordHooked(art::ArtMethod *target, const art::dex::ClassDef *class
         [&class_def, &target](const auto &ctor) {
             ctor(class_def, phmap::flat_hash_set<art::ArtMethod *>{target});
         });
-    hooked_methods_.insert({std::make_pair(target, std::make_pair(reflected_backup, backup)),
-                            std::make_pair(backup, std::make_pair(nullptr, target))});
+    // Hook() claims the target with a pending sentinel first; replace it here with the real
+    // record instead of inserting, which would silently fail on the existing key.
+    hooked_methods_.try_emplace_l(
+        target, [reflected_backup, backup](auto &it) { it.second = {reflected_backup, backup}; },
+        reflected_backup, backup);
+    hooked_methods_.insert({backup, std::pair<jobject, art::ArtMethod *>{nullptr, target}});
 }
 
 inline void RecordDeoptimized(const art::dex::ClassDef *class_def, art::ArtMethod *art_method) {

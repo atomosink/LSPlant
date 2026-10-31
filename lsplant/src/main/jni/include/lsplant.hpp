@@ -147,10 +147,9 @@ struct InitInfo {
 /// InitInfo.
 /// \note This function thread safe (you can call it simultaneously from multiple thread)
 /// but it's not atomic to the same \b target_method. That means #UnHook() or #IsHooked() does not
-/// guarantee to work properly on the same \p target_method before it returns. Also, simultaneously
-/// call on this function with the same \p target_method does not guarantee only one will success.
-/// If you call this with different \p hooker_object on the same target_method simultaneously, the
-/// behavior is undefined.
+/// guarantee to work properly on the same \p target_method before it returns. Simultaneous calls
+/// on this function with the same \p target_method are claimed atomically, so exactly one of them
+/// succeeds and the others return null; which one wins is unspecified.
 /// \note The behavior of getting the \ref jmethodID of the backup method is undefined.
 [[nodiscard, maybe_unused, gnu::visibility("default")]] jobject Hook(JNIEnv *env,
                                                                      jobject target_method,

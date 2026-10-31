@@ -920,6 +920,17 @@ using ::lsplant::IsHooked;
         return nullptr;
     }
 
+    // Atomically claim the target with a pending sentinel before patching the entry point.
+    // Two concurrent Hook() calls on the same target would otherwise both pass the IsHooked()
+    // check above and both run DoHook, corrupting the backup chain. The sentinel is replaced
+    // by the real record in RecordHooked() and dropped again if DoHook fails.
+    constexpr const std::pair<jobject, art::ArtMethod *> kPendingHook{nullptr, nullptr};
+    if (!hooked_methods_.try_emplace_l(target, [](auto &) {}, kPendingHook)) {
+        LOGW("Skip duplicate hook (concurrent)");
+        env->DeleteGlobalRef(global_backup);
+        return nullptr;
+    }
+
     if (DoHook(target, hook, backup)) {
         std::apply(
             [backup_method, target_method_id = env->FromReflectedMethod(target_method)](auto... v) {
@@ -941,7 +952,8 @@ using ::lsplant::IsHooked;
         return global_backup;
     }
 
-    // DoHook failed: release the pre-created global reference.
+    // DoHook failed: drop the pending sentinel and release the pre-created global reference.
+    hooked_methods_.erase(target);
     env->DeleteGlobalRef(global_backup);
     return nullptr;
 }
