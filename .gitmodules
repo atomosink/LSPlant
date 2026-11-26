@@ -3,5 +3,5 @@
 	url = https://github.com/jothepro/doxygen-awesome-css.git
 [submodule "lsplant/src/main/jni/external/dex_builder"]
 	path = lsplant/src/main/jni/external/dex_builder
-	url = https://github.com/AtomicCedar/DexBuilder.git
+	url = https://github.com/AtomosInk/DexBuilder.git
 	branch = master
