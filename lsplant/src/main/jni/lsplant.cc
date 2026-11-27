@@ -157,6 +157,10 @@ bool InitConfig(const InitInfo &info) {
         LOGE("executable memory recycler cannot be null");
         return false;
     }
+    if (info.mem_map && !info.mem_unmap) {
+        LOGE("mem_unmap must be set when mem_map is set");
+        return false;
+    }
     generated_class_name = info.generated_class_name;
     generated_field_name = info.generated_field_name;
     generated_method_name = info.generated_method_name;
@@ -482,6 +486,7 @@ std::tuple<jclass, jfieldID, jmethodID, jmethodID> BuildDex(JNIEnv *env, jobject
             generated_source_name.empty() ? "lsplant" : generated_source_name, &err_msg);
         if (!dex) {
             LOGE("Failed to open memory dex: %s", err_msg.data());
+            MyMunmap(target, image.size());
         } else {
             java_dex_file = ScopedLocalRef(env, dex ? dex->ToJavaDexFile(env) : nullptr);
         }
@@ -753,6 +758,9 @@ bool DoUnHook(ArtMethod *target, ArtMethod *backup) {
     auto *entry_point = target->GetEntryPoint();
     target->CopyFrom(backup);
     target->SetAccessFlags(access_flags);
+    // Users' allocator/recycler are expected to hand out standalone pages, so their
+    // trampoline start never coincides with a page owned by our internal mmap/dual
+    // regions below; the contains() checks only filter our own allocations.
     if (auto *start = __builtin_align_down(entry_point, kPageSize); executable_memory_recycler &&
                                                                     !mmap_regions.contains(start) &&
                                                                     !dual_regions.contains(start)) {
@@ -980,7 +988,9 @@ using ::lsplant::IsHooked;
     // Encode before the backup is unregistered: with opaque JNI ids (java-debuggable runtime)
     // this call goes through JniIdManager::EncodeGenericId, which relies on IsBackup().
     auto *backup_method = env->FromReflectedMethod(reflected_backup);
-    // FIXME: not atomic, but should be fine
+    // Backed-up ArtMethods registered by RecordHooked hold the only references to this
+    // backup entry, and the caller of UnHook drops its reflected_backup afterwards, so a
+    // non-atomic erase here is safe: no other thread can reach this record concurrently.
     hooked_methods_.erase(backup);
     proxied_backup_methods_.erase(backup);
     env->DeleteGlobalRef(reflected_backup);
