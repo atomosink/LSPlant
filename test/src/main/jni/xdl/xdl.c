@@ -542,10 +542,22 @@ static void *xdl_open_always_force(const char *filename) {
 
   // find
   xdl_t *self = xdl_find(filename);
-  if (NULL == self)
+  if (NULL == self) {
     dlclose(linker_handle);
-  else
-    self->linker_handle = linker_handle;
+  } else {
+    // Serialize the linker_handle publication: two concurrent force-opens of the same
+    // library must not clobber each other's handle (the loser closes its own duplicate).
+    // A per-object lock is unavailable in this vendored 2.x code, so use a static mutex.
+    static pthread_mutex_t linker_handle_lock = PTHREAD_MUTEX_INITIALIZER;
+    void *dup = NULL;
+    pthread_mutex_lock(&linker_handle_lock);
+    if (NULL == self->linker_handle)
+      self->linker_handle = linker_handle;
+    else
+      dup = linker_handle;
+    pthread_mutex_unlock(&linker_handle_lock);
+    if (NULL != dup) dlclose(dup);
+  }
 
   return (void *)self;
 }
@@ -700,22 +712,32 @@ static void *xdl_resolve_symbol_address(xdl_t *self, ElfW(Sym) *sym, size_t *sym
       if (NULL == getauxval) return NULL;
       typedef void *(*ifunc_resolver_t)(uint64_t, xdl_ifunc_arg_t *);
       static xdl_ifunc_arg_t arg;
+      static pthread_mutex_t ifunc_lock = PTHREAD_MUTEX_INITIALIZER;
       static bool initialized = false;
       if (!__atomic_load_n(&initialized, __ATOMIC_ACQUIRE)) {
-        arg.size = sizeof(xdl_ifunc_arg_t);
-        arg.hwcap = getauxval(AT_HWCAP);
-        arg.hwcap2 = getauxval(AT_HWCAP2);
-        __atomic_store_n(&initialized, true, __ATOMIC_RELEASE);
+        pthread_mutex_lock(&ifunc_lock);
+        if (!__atomic_load_n(&initialized, __ATOMIC_RELAXED)) {
+          arg.size = sizeof(xdl_ifunc_arg_t);
+          arg.hwcap = getauxval(AT_HWCAP);
+          arg.hwcap2 = getauxval(AT_HWCAP2);
+          __atomic_store_n(&initialized, true, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&ifunc_lock);
       }
       real_sym_addr = ((ifunc_resolver_t)sym_addr)(arg.hwcap | XDL_IFUNC_ARG_HWCAP, &arg);
 #elif defined(__arm__)
       if (NULL == getauxval) return NULL;
       typedef void *(*ifunc_resolver_t)(unsigned long);
       static unsigned long hwcap;
+      static pthread_mutex_t ifunc_lock = PTHREAD_MUTEX_INITIALIZER;
       static bool initialized = false;
       if (!__atomic_load_n(&initialized, __ATOMIC_ACQUIRE)) {
-        hwcap = getauxval(AT_HWCAP);
-        __atomic_store_n(&initialized, true, __ATOMIC_RELEASE);
+        pthread_mutex_lock(&ifunc_lock);
+        if (!__atomic_load_n(&initialized, __ATOMIC_RELAXED)) {
+          hwcap = getauxval(AT_HWCAP);
+          __atomic_store_n(&initialized, true, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&ifunc_lock);
       }
       real_sym_addr = ((ifunc_resolver_t)sym_addr)(hwcap);
 #else
